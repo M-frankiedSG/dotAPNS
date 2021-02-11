@@ -50,7 +50,7 @@ namespace dotAPNS
 
         string _jwt;
         DateTime _lastJwtGenerationTime;
-        readonly object _jwtRefreshLock = new object();
+        readonly SemaphoreSlim _jwtRefreshLock = new SemaphoreSlim(1,1);
 
         readonly HttpClient _http;
         readonly bool _useCert;
@@ -135,7 +135,7 @@ namespace dotAPNS
             req.Headers.Add("apns-push-type", push.Type.ToString().ToLowerInvariant());
             req.Headers.Add("apns-topic", GetTopic(push.Type));
             if (!_useCert)
-                req.Headers.Authorization = new AuthenticationHeaderValue("bearer", GetOrGenerateJwt());
+                req.Headers.Authorization = new AuthenticationHeaderValue("bearer", await GetOrGenerateJwt(ct));
             if (push.Expiration.HasValue)
             {
                 var exp = push.Expiration.Value;
@@ -292,21 +292,46 @@ namespace dotAPNS
             }
         }
 
-        string GetOrGenerateJwt()
+        public Action<string,DateTime> TokenGenerationNotification = null;
+        //valuetuples are not available in this project
+        public Func<string,string,DateTime,TimeSpan,string,CancellationToken,Task<Tuple<string,DateTime>>> TokenStoreCallback = null;
+
+        async Task<string> GetOrGenerateJwt(CancellationToken ct)
         {
-            lock (_jwtRefreshLock)
-            {
-                return GetOrGenerateJwtInternal();
+            await _jwtRefreshLock.WaitAsync(ct).ConfigureAwait(false);
+            try {
+                return await GetOrGenerateJwtInternal(ct);
+            } finally {
+                _jwtRefreshLock.Release();
             }
 
-            string GetOrGenerateJwtInternal()
-            {
-                if (_lastJwtGenerationTime > DateTime.UtcNow - TimeSpan.FromMinutes(20)) // refresh no more than once every 20 minutes
-                    return _jwt;
-                var now = DateTimeOffset.UtcNow;
+        }
 
+        async Task<string> GetOrGenerateJwtInternal(CancellationToken ct) {
+            //floor to 1 second as ToUnixTimeSeconds will do that anyway and we need to protect
+            //against limited precision fields in a token store
+            var exp = TimeSpan.FromMinutes(30);
+            var now = dateFloorSpan(DateTime.UtcNow, TimeSpan.FromSeconds(1));
+            var exptime = now - exp;
+            if (_lastJwtGenerationTime > exptime) // not the absolute minimum
+                return _jwt;
+
+            string newtoken = generateJwtInternal();
+            if(TokenStoreCallback==null) {
+                _jwt = newtoken;
+                _lastJwtGenerationTime = now;
+                TokenGenerationNotification?.Invoke(newtoken, now);
+            } else {
+                var res = await TokenStoreCallback(_teamId, _keyId, now, exp, newtoken, ct);
+                _jwt = res.Item1;
+                _lastJwtGenerationTime = res.Item2;
+            }
+            return _jwt;
+
+            string generateJwtInternal() {
+                var nowoffset = new DateTimeOffset(now, TimeSpan.Zero);
                 string header = JsonConvert.SerializeObject((new { alg = "ES256", kid = _keyId }));
-                string payload = JsonConvert.SerializeObject(new { iss = _teamId, iat = now.ToUnixTimeSeconds() });
+                string payload = JsonConvert.SerializeObject(new { iss = _teamId, iat = nowoffset.ToUnixTimeSeconds() });
 
                 string headerBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(header));
                 string payloadBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(payload));
@@ -322,10 +347,15 @@ namespace dotAPNS
 #else
                 signature = _key.SignData(Encoding.UTF8.GetBytes(unsignedJwtData), HashAlgorithmName.SHA256);
 #endif
-                _jwt = $"{unsignedJwtData}.{Convert.ToBase64String(signature)}";
-                _lastJwtGenerationTime = now.UtcDateTime;
-                return _jwt;
+                return $"{unsignedJwtData}.{Convert.ToBase64String(signature)}";
             }
         }
+
+        public static DateTime dateFloorSpan(DateTime date,TimeSpan span) {
+            long dateTicks=date.Ticks;
+            long spanTicks=span.Ticks;
+            return new DateTime((dateTicks/spanTicks)*spanTicks, date.Kind);
+        }
+
     }
 }
